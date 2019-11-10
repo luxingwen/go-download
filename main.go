@@ -1,6 +1,8 @@
 package main
 
 import (
+	"bufio"
+	"context"
 	"errors"
 	"flag"
 	"fmt"
@@ -86,16 +88,16 @@ func NewFileDownload(urlAddress, dir string) (r *FileDownload, err error) {
 	switch true {
 	case lessize <= 1024*1024*10:
 		r.worknum = 8
-		r.blockSize = lessize / 8
+		r.blockSize = lessize / r.worknum
 	case lessize > 1024*1024*10 && lessize <= 1024*1024*100: // 小于 100m
-		r.worknum = 16
-		r.blockSize = lessize / 8
+		r.worknum = 8
+		r.blockSize = lessize / r.worknum
 	case lessize > 1024*1024*100 && lessize <= 1024*1024*1024: // 大于100M 小于1G
-		r.worknum = 32
-		r.blockSize = lessize / 16
+		r.worknum = 16
+		r.blockSize = lessize / r.worknum
 	default:
-		r.worknum = 64
-		r.blockSize = 1024 * 1024 * 64 // 每块 64m
+		r.worknum = 16
+		r.blockSize = lessize / r.worknum
 	}
 
 	return
@@ -108,10 +110,10 @@ func (fd *FileDownload) download() (err error) {
 			select {
 			case <-time.After(1 * time.Second):
 				num := atomic.LoadInt64(&fd.currentSize) - atomic.LoadInt64(&fd.preSize)
-				fd.preSize = fd.currentSize
 				speed := float64(num)
 				fmt.Printf("download %s ---> %s/%s %.3f%% speed:%s/s\n", fd.filename, byteFormatPrint(fd.currentSize),
 					byteFormatPrint(fd.size), float64(fd.currentSize)/float64(fd.size)*100, byteFormatPrintFloat(speed))
+				fd.preSize = fd.currentSize
 				if fd.currentSize >= fd.size {
 					return
 				}
@@ -159,7 +161,7 @@ func (fd *FileDownload) download() (err error) {
 	flag := false
 	for begin < fd.size && !flag {
 
-		for i := 1; i <= 32; i++ {
+		for i := 1; i <= int(fd.worknum+1); i++ {
 			if begin > fd.size {
 				break
 			}
@@ -184,7 +186,11 @@ func (fd *FileDownload) download() (err error) {
 			itemBlock := item
 			wg.Add(1)
 			go func(block *BlockFile) {
-				defer wg.Done()
+
+				defer func() {
+					wg.Done()
+					fmt.Println(block.filename, "下载完成啦！")
+				}()
 				_, err := block.startDownload(fd.url, fd)
 				if err != nil {
 					fd.err = err.Error()
@@ -238,9 +244,13 @@ func (bl *BlockFile) download(urlAddress string, fd *FileDownload) (err error) {
 		return
 	}
 	defer resp.Body.Close()
-	buf := make([]byte, 4096)
+
+	fmt.Println(bl.filename, "开始下载")
+
+	reader := bufio.NewReaderSize(resp.Body, 1024*32)
+	buf := make([]byte, 1024*32)
 	for {
-		n, err := resp.Body.Read(buf)
+		n, err := reader.Read(buf)
 		needSize := bl.end + 1 - bl.offset
 		if n > int(needSize) {
 			n = int(needSize)
@@ -259,6 +269,7 @@ func (bl *BlockFile) download(urlAddress string, fd *FileDownload) (err error) {
 			}
 			return err
 		}
+
 	}
 	return nil
 }
