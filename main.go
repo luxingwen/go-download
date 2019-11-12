@@ -2,6 +2,7 @@ package main
 
 import (
 	"bufio"
+	"context"
 	"errors"
 	"flag"
 	"fmt"
@@ -43,6 +44,7 @@ type BlockFile struct {
 	start    int64
 	end      int64
 	offset   int64 // 文件偏移
+	done     bool  // 是否完成了
 	file     *os.File
 }
 
@@ -100,6 +102,16 @@ func NewFileDownload(urlAddress, dir string) (r *FileDownload, err error) {
 	}
 
 	return
+}
+
+func (fd *FileDownload) checkBlockAllDone() bool {
+	sum := 0
+	for _, item := range fd.blocks {
+		if item.done {
+			sum++
+		}
+	}
+	return sum == len(fd.blocks)
 }
 
 func (fd *FileDownload) download() (err error) {
@@ -180,26 +192,36 @@ func (fd *FileDownload) download() (err error) {
 			}
 			begin = 1 + end
 		}
-		wg := new(sync.WaitGroup)
-		for _, item := range fd.blocks {
-			itemBlock := item
-			wg.Add(1)
-			go func(block *BlockFile) {
-
-				defer func() {
-					wg.Done()
-					fmt.Println(block.filename, "下载完成啦！")
-				}()
-				_, err := block.startDownload(fd.url, fd)
-				if err != nil {
-					fd.err = err.Error()
-					return
+		for !fd.checkBlockAllDone() {
+			wg := new(sync.WaitGroup)
+			ctx, cacel := context.WithCancel(context.Background())
+			for _, item := range fd.blocks {
+				if item.done {
+					continue
 				}
-				return
-			}(itemBlock)
+				itemBlock := item
+				wg.Add(1)
+				go func(block *BlockFile) {
+					defer func() {
+						wg.Done()
+						if block.done {
+							fmt.Println(block.filename, "下载完成啦！")
+						} else {
+							fmt.Println(block.filename, "即将重新下载")
+						}
 
+					}()
+					_, err := block.startDownload(fd.url, fd, ctx, cacel)
+					if err != nil {
+						fd.err = err.Error()
+						return
+					}
+					return
+				}(itemBlock)
+
+			}
+			wg.Wait()
 		}
-		wg.Wait()
 		for _, item := range fd.blocks {
 			itemBlock := item
 			fsrc, err := os.Open(itemBlock.filename)
@@ -230,7 +252,7 @@ func (fd *FileDownload) download() (err error) {
 	return nil
 }
 
-func (bl *BlockFile) download(urlAddress string, fd *FileDownload) (err error) {
+func (bl *BlockFile) download(urlAddress string, fd *FileDownload, ctx context.Context, cancel context.CancelFunc) (err error) {
 	client := &http.Client{}
 	req, err := http.NewRequest("GET", urlAddress, nil)
 	if err != nil {
@@ -264,16 +286,24 @@ func (bl *BlockFile) download(urlAddress string, fd *FileDownload) (err error) {
 		bl.offset += int64(nw)
 		if err != nil {
 			if err == io.EOF {
+				bl.done = true
+				cancel()
 				return nil
 			}
 			return err
+		}
+		select {
+		case <-ctx.Done():
+			return nil
+		default:
+			continue
 		}
 
 	}
 	return nil
 }
 
-func (bl *BlockFile) startDownload(urlAddress string, fd *FileDownload) (filesize int64, err error) {
+func (bl *BlockFile) startDownload(urlAddress string, fd *FileDownload, ctx context.Context, cancel context.CancelFunc) (filesize int64, err error) {
 	filesize = bl.end - bl.start
 	isExit, start := isFileExit(bl.filename, filesize)
 	if bl.file != nil {
@@ -284,6 +314,7 @@ func (bl *BlockFile) startDownload(urlAddress string, fd *FileDownload) (filesiz
 			bl.offset = filesize
 			atomic.AddInt64(&fd.currentSize, filesize)
 			atomic.AddInt64(&fd.preSize, filesize)
+			bl.done = true
 			return filesize, nil
 		}
 		bl.file, err = os.OpenFile(bl.filename, os.O_WRONLY|os.O_RDONLY, 0777)
@@ -301,7 +332,7 @@ func (bl *BlockFile) startDownload(urlAddress string, fd *FileDownload) (filesiz
 	bl.offset = start
 	atomic.AddInt64(&fd.currentSize, start)
 	atomic.AddInt64(&fd.preSize, start)
-	err = bl.download(urlAddress, fd)
+	err = bl.download(urlAddress, fd, ctx, cancel)
 	if err != nil {
 		return
 	}
